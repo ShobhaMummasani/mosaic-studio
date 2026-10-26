@@ -8,10 +8,9 @@ from skimage.metrics import structural_similarity as ssim
 
 
 # =====================================================
-#  PART 1: IMAGE PROCESSING FUNCTIONS
+# PART 1: IMAGE PROCESSING FUNCTIONS
 # =====================================================
 
-# ---------- Pre-processing (enhance the photo first) ----------
 def enhance(img, brightness=0, contrast=1.0, saturation=1.0, sharpen=0.0):
     out = cv2.convertScaleAbs(img, alpha=contrast, beta=brightness)
     if saturation != 1.0:
@@ -24,7 +23,6 @@ def enhance(img, brightness=0, contrast=1.0, saturation=1.0, sharpen=0.0):
     return out
 
 
-# ---------- Color quantization (K-Means in Lab) ----------
 def build_palette(img_bgr, n_colors):
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
     if len(lab) > 20000:
@@ -32,6 +30,7 @@ def build_palette(img_bgr, n_colors):
         sample = lab[idx]
     else:
         sample = lab
+    n_colors = max(1, min(int(n_colors), len(sample)))
     km = KMeans(n_clusters=n_colors, n_init=3, random_state=0).fit(sample)
     return km.cluster_centers_.astype(np.float32)
 
@@ -54,14 +53,12 @@ def palette_image(palette_bgr):
     return cv2.cvtColor(sw, cv2.COLOR_BGR2RGB)
 
 
-# ---------- Edge map ----------
 def edge_map(img_bgr, low=80, high=160):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     return cv2.Canny(gray, low, high)
 
 
-# ---------- Adaptive tiles (quadtree) ----------
 def quadtree_cells(img_bgr, edges, max_tile, min_tile, var_thresh, edge_aware):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     H, W = gray.shape
@@ -97,7 +94,6 @@ def uniform_cells(shape, tile):
             for y in range(0, H, tile) for x in range(0, W, tile)]
 
 
-# ---------- Draw one tile ----------
 def draw_tile(canvas, x, y, w, h, color, shape, gap, rng, jitter):
     g = min(int(gap), max(0, min(w, h) // 6))
     x0, y0 = x + g // 2, y + g // 2
@@ -119,26 +115,27 @@ def draw_tile(canvas, x, y, w, h, color, shape, gap, rng, jitter):
         cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), color, -1)
     elif shape == "circle":
         c = ((x0 + x1) // 2, (y0 + y1) // 2)
-        cv2.ellipse(canvas, c, ((x1 - x0) // 2, (y1 - y0) // 2), 0, 0, 360, color, -1)
+        cv2.ellipse(canvas, c, (max(1, (x1 - x0) // 2), max(1, (y1 - y0) // 2)),
+                    0, 0, 360, color, -1)
     elif shape == "diamond":
         cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
         pts = np.array([[cx, y0], [x1 - 1, cy], [cx, y1 - 1], [x0, cy]], np.int32)
         cv2.fillPoly(canvas, [pts], color)
 
 
-# ---------- Stained-glass mosaic (Voronoi cells) ----------
 def voronoi_mosaic(img_bgr, tile_size, palette_lab, edges, edge_aware,
                    gap, grout, seed=0):
     rng = np.random.RandomState(seed)
     H, W = img_bgr.shape[:2]
     pts = [(x + rng.uniform(0, tile_size), y + rng.uniform(0, tile_size))
            for y in range(0, H, tile_size) for x in range(0, W, tile_size)]
-    if edge_aware:  # extra seeds on edges -> smaller cells near details
+    if edge_aware:
         ys, xs = np.nonzero(edges)
         if len(xs) > 0:
             n_extra = min(len(xs), int(0.7 * len(pts)))
-            pick = rng.choice(len(xs), n_extra, replace=False)
-            pts += list(zip(xs[pick].astype(float), ys[pick].astype(float)))
+            if n_extra:
+                pick = rng.choice(len(xs), n_extra, replace=False)
+                pts += list(zip(xs[pick].astype(float), ys[pick].astype(float)))
     pts = np.array(pts)
     pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
     pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
@@ -151,8 +148,10 @@ def voronoi_mosaic(img_bgr, tile_size, palette_lab, edges, edge_aware,
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float64)
     counts = np.bincount(labels, minlength=n).astype(np.float64)
     counts[counts == 0] = 1
-    means = np.stack([np.bincount(labels, weights=lab[:, c], minlength=n) / counts
-                      for c in range(3)], axis=1).astype(np.float32)
+    means = np.stack([
+        np.bincount(labels, weights=lab[:, c], minlength=n) / counts
+        for c in range(3)
+    ], axis=1).astype(np.float32)
 
     pal_bgr = palette_to_bgr(palette_lab)
     cell_color = pal_bgr[nearest_idx(means, palette_lab)]
@@ -172,13 +171,20 @@ def voronoi_mosaic(img_bgr, tile_size, palette_lab, edges, edge_aware,
     return canvas, int(len(np.unique(labels))), layout
 
 
-# ---------- Photo mosaic (use your own small images as tiles) ----------
 def photo_mosaic(img_bgr, tile_imgs, tile_size, tint=0.2):
-    means = np.array([cv2.cvtColor(t, cv2.COLOR_BGR2LAB).reshape(-1, 3).mean(axis=0)
-                      for t in tile_imgs], np.float32)
+    """Build a photo mosaic from one or more user-uploaded tile images."""
+    if not tile_imgs:
+        raise ValueError("Upload at least one image in the Photo tiles section.")
+
+    means = np.array([
+        cv2.cvtColor(t, cv2.COLOR_BGR2LAB).reshape(-1, 3).mean(axis=0)
+        for t in tile_imgs
+    ], np.float32)
+
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     out = np.zeros_like(img_bgr)
     cells = uniform_cells(img_bgr.shape, tile_size)
+
     for (x, y, w, h) in cells:
         avg_lab = lab[y:y + h, x:x + w].reshape(-1, 3).mean(axis=0)
         best = int(np.argmin(((means - avg_lab) ** 2).sum(axis=1)))
@@ -186,13 +192,13 @@ def photo_mosaic(img_bgr, tile_imgs, tile_size, tint=0.2):
         avg_bgr = img_bgr[y:y + h, x:x + w].reshape(-1, 3).mean(axis=0)
         t = (1 - tint) * t + tint * avg_bgr
         out[y:y + h, x:x + w] = np.clip(t, 0, 255).astype(np.uint8)
+
     layout = img_bgr.copy()
     for (x, y, w, h) in cells:
         cv2.rectangle(layout, (x, y), (x + w - 1, y + h - 1), (0, 0, 0), 1)
     return out, len(cells), layout
 
 
-# ---------- Main mosaic function ----------
 def make_mosaic(img_bgr, tile_size=16, n_colors=16, shape="square",
                 style="flat", adaptive=False, edge_aware=False,
                 min_tile=6, var_thresh=18.0, gap=2, palette=None, seed=0):
@@ -221,6 +227,7 @@ def make_mosaic(img_bgr, tile_size=16, n_colors=16, shape="square",
     pal_bgr = palette_to_bgr(palette)
     canvas = np.full_like(img_bgr, grout)
     layout = img_bgr.copy()
+
     for (x, y, w, h) in cells:
         avg = lab[y:y + h, x:x + w].reshape(-1, 3).mean(axis=0)
         idx = nearest_idx(avg.reshape(1, 3).astype(np.float32), palette)[0]
@@ -230,7 +237,6 @@ def make_mosaic(img_bgr, tile_size=16, n_colors=16, shape="square",
     return canvas, len(cells), layout
 
 
-# ---------- Quality measures ----------
 def quality(original, mosaic):
     a = original.astype(np.float64)
     b = mosaic.astype(np.float64)
@@ -250,212 +256,88 @@ def decode(file_obj):
 
 
 # =====================================================
-#  LOOK AND FEEL (colors, cards, buttons)
+# LOOK AND FEEL
 # =====================================================
-TILE_COLORS = ["#ff6ec4", "#7873f5", "#4adede", "#ffd166", "#ff9770",
-               "#06d6a0", "#ef476f", "#118ab2", "#b388ff", "#f9c74f"]
-
-
 def apply_style():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');
-
-    .stApp {
-        background: linear-gradient(135deg, #fff7fb 0%, #f5f0ff 50%, #eafaff 100%);
-        font-family: 'Poppins', sans-serif;
-    }
-
-    h1, h2, h3, h4, p, label, button {
-        font-family: 'Poppins', sans-serif;
-    }
-
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #fff0f7 0%, #f0eaff 55%, #e7faff 100%);
-        border-right: 2px solid white;
-    }
-
-    [data-testid="stSidebar"] h2 {
-        color: #7147bd;
-        font-size: 1.1rem;
-        font-weight: 700;
-        border-bottom: 2px solid #e8b4e8;
-        padding-bottom: 7px;
-        margin-top: 14px;
-    }
-
-    /* Premium welcome banner */
-    .hero {
-        position: relative;
-        overflow: hidden;
-        background: linear-gradient(115deg, #d94db6 0%, #8b65e8 52%, #38bfd0 100%);
-        border-radius: 28px;
-        padding: 38px 42px;
-        margin: 18px 0 30px 0;
-        box-shadow: 0 15px 40px rgba(115, 78, 180, 0.22);
-    }
-
-    .hero::after {
-        content: "";
-        position: absolute;
-        width: 230px;
-        height: 230px;
-        right: -75px;
-        top: -100px;
-        border-radius: 50%;
-        background: rgba(255, 255, 255, 0.10);
-        pointer-events: none;
-    }
-
-    .hero h1 {
-        color: white;
-        margin: 0 0 12px 0;
-        font-size: 2.6rem;
-        font-weight: 800;
-        letter-spacing: -1px;
-    }
-
-    .hero p {
-        color: white;
-        font-size: 1.08rem;
-        line-height: 1.8;
-        margin: 0;
-        max-width: 720px;
-    }
-
-    .hero .eyebrow {
-        display: inline-block;
-        color: white;
-        background: rgba(255, 255, 255, 0.18);
-        border: 1px solid rgba(255, 255, 255, 0.35);
-        border-radius: 999px;
-        padding: 6px 13px;
-        margin-bottom: 16px;
-        font-size: 0.78rem;
-        font-weight: 600;
-        letter-spacing: 1px;
-    }
-
-    .hero .subtitle {
-        margin-top: 12px;
-        opacity: 0.94;
-    }
-
-    [data-testid="stImage"] img {
-        border-radius: 18px;
-        border: 3px solid white;
-        box-shadow: 0 8px 24px rgba(90, 60, 160, 0.13);
-    }
-
-    [data-testid="stImageCaption"] {
-        color: #7147bd;
-        font-weight: 600;
-        text-align: center;
-    }
-
-    [data-testid="stMetric"] {
-        background: rgba(255, 255, 255, 0.92);
-        border-radius: 18px;
-        padding: 16px 18px;
-        box-shadow: 0 6px 20px rgba(90, 60, 160, 0.09);
-        border-left: 5px solid #bd8be8;
-    }
-
-    [data-testid="stMetricValue"] {
-        color: #7147bd;
-        font-weight: 700;
-    }
-
-    .stButton > button,
-    .stDownloadButton > button {
-        background: linear-gradient(100deg, #d94db6, #8263e6);
-        color: white;
-        border: none;
-        border-radius: 999px;
-        padding: 0.65rem 1.6rem;
-        font-weight: 600;
-        box-shadow: 0 6px 18px rgba(130, 99, 230, 0.22);
-        transition: all 0.2s ease;
-    }
-
-    .stButton > button:hover,
-    .stDownloadButton > button:hover {
-        transform: translateY(-2px);
-        color: white;
-        box-shadow: 0 10px 25px rgba(130, 99, 230, 0.3);
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 10px;
-        border-bottom: none;
-    }
-
-    .stTabs [data-baseweb="tab-highlight"],
-    .stTabs [data-baseweb="tab-border"] {
-        display: none;
-    }
-
-    .stTabs button[role="tab"] {
-        background: white;
-        border-radius: 999px;
-        padding: 8px 20px;
-        box-shadow: 0 3px 12px rgba(90, 60, 160, 0.08);
-    }
-
-    .stTabs button[role="tab"][aria-selected="true"] {
-        background: linear-gradient(100deg, #d94db6, #8263e6);
-    }
-
-    .stTabs button[role="tab"][aria-selected="true"] p {
-        color: white;
-        font-weight: 700;
-    }
-
-    [data-testid="stFileUploaderDropzone"] {
-        background: rgba(255, 255, 255, 0.85);
-        border: 2px dashed #d69adf;
-        border-radius: 16px;
-    }
+    .stApp {background: linear-gradient(135deg, #fff7fb 0%, #f5f0ff 50%, #eafaff 100%); font-family:'Poppins',sans-serif;}
+    h1,h2,h3,h4,p,label,button {font-family:'Poppins',sans-serif;}
+    [data-testid="stSidebar"] {background:linear-gradient(180deg,#fff0f7 0%,#f0eaff 55%,#e7faff 100%);border-right:2px solid white;}
+    [data-testid="stSidebar"] h2 {color:#7147bd;font-size:1.1rem;font-weight:700;border-bottom:2px solid #e8b4e8;padding-bottom:7px;margin-top:14px;}
+    .hero {position:relative;overflow:hidden;background:linear-gradient(115deg,#d94db6 0%,#8b65e8 52%,#38bfd0 100%);border-radius:28px;padding:38px 42px;margin:18px 0 30px 0;box-shadow:0 15px 40px rgba(115,78,180,.22);}
+    .hero::after {content:"";position:absolute;width:230px;height:230px;right:-75px;top:-100px;border-radius:50%;background:rgba(255,255,255,.10);pointer-events:none;}
+    .hero h1 {color:white;margin:0 0 12px 0;font-size:2.6rem;font-weight:800;letter-spacing:-1px;}
+    .hero p {color:white;font-size:1.08rem;line-height:1.8;margin:0;max-width:720px;}
+    .hero .eyebrow {display:inline-block;color:white;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:6px 13px;margin-bottom:16px;font-size:.78rem;font-weight:600;letter-spacing:1px;}
+    .hero .subtitle {margin-top:12px;opacity:.94;}
+    [data-testid="stImage"] img {border-radius:18px;border:3px solid white;box-shadow:0 8px 24px rgba(90,60,160,.13);}
+    [data-testid="stImageCaption"] {color:#7147bd;font-weight:600;text-align:center;}
+    [data-testid="stMetric"] {background:rgba(255,255,255,.92);border-radius:18px;padding:16px 18px;box-shadow:0 6px 20px rgba(90,60,160,.09);border-left:5px solid #bd8be8;}
+    [data-testid="stMetricValue"] {color:#7147bd;font-weight:700;}
+    .stButton>button,.stDownloadButton>button {background:linear-gradient(100deg,#d94db6,#8263e6);color:white;border:none;border-radius:999px;padding:.65rem 1.6rem;font-weight:600;box-shadow:0 6px 18px rgba(130,99,230,.22);transition:all .2s ease;}
+    .stButton>button:hover,.stDownloadButton>button:hover {transform:translateY(-2px);color:white;box-shadow:0 10px 25px rgba(130,99,230,.3);}
+    .stTabs [data-baseweb="tab-list"] {gap:10px;border-bottom:none;}
+    .stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"] {display:none;}
+    .stTabs button[role="tab"] {background:white;border-radius:999px;padding:8px 20px;box-shadow:0 3px 12px rgba(90,60,160,.08);}
+    .stTabs button[role="tab"][aria-selected="true"] {background:linear-gradient(100deg,#d94db6,#8263e6);}
+    .stTabs button[role="tab"][aria-selected="true"] p {color:white;font-weight:700;}
+    [data-testid="stFileUploaderDropzone"] {background:rgba(255,255,255,.85);border:2px dashed #d69adf;border-radius:16px;}
     </style>
-
     <div class="hero">
-        <div class="eyebrow">CREATIVE ART</div>
-        <h1>🎨 Mosaic Studio</h1>
-        <p>Transform your favourite photographs into beautiful, colourful mosaic artwork.</p>
-        <p class="subtitle">Explore artistic tile styles, experiment with colours, and create a masterpiece of your own.</p>
+      <div class="eyebrow">CREATIVE ART</div>
+      <h1>🎨 Mosaic Studio</h1>
+      <p>Transform your favourite photographs into beautiful, colourful mosaic artwork.</p>
+      <p class="subtitle">Explore artistic tile styles, experiment with colours, and create a masterpiece of your own.</p>
     </div>
     """, unsafe_allow_html=True)
 
 
-# =====================================================
-#  PART 2: THE WEBSITE
-# =====================================================
 PRESETS = {
     "Custom (use sliders)": {},
-    "Roman floor": dict(tile=12, colors=10, shape="square", style="ancient",
-                        adaptive=False, edge=False, gap=2),
-    "Pixel art": dict(tile=14, colors=12, shape="square", style="flat",
-                      adaptive=False, edge=False, gap=0),
-    "Pop-art dots": dict(tile=12, colors=8, shape="circle", style="flat",
-                         adaptive=False, edge=False, gap=1),
-    "Stained glass": dict(tile=18, colors=14, shape="stained glass", style="flat",
-                          adaptive=False, edge=True, gap=2),
-    "Smart detail (best quality)": dict(tile=16, colors=24, shape="square",
-                                        style="flat", adaptive=True, edge=True, gap=1),
+    "Roman floor": dict(tile=12, colors=10, shape="square", style="ancient", adaptive=False, edge=False, gap=2),
+    "Pixel art": dict(tile=14, colors=12, shape="square", style="flat", adaptive=False, edge=False, gap=0),
+    "Pop-art dots": dict(tile=12, colors=8, shape="circle", style="flat", adaptive=False, edge=False, gap=1),
+    "Stained glass": dict(tile=18, colors=14, shape="stained glass", style="flat", adaptive=False, edge=True, gap=2),
+    "Smart detail (best quality)": dict(tile=16, colors=24, shape="square", style="flat", adaptive=True, edge=True, gap=1),
 }
 
 
+# =====================================================
+# PART 2: STREAMLIT APPLICATION
+# =====================================================
 def main():
-    st.set_page_config(page_title="Mosaic Generator", page_icon="🎨", layout="wide")
+    st.set_page_config(page_title="Mosaic Studio", page_icon="🎨", layout="wide")
     apply_style()
-
     sb = st.sidebar
+
     sb.header("1. Photo")
-    uploaded = sb.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"])
+    uploaded = sb.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"], key="main_photo")
 
     sb.header("2. Mosaic type")
     mode = sb.radio("Mode", ["Color tiles", "Photo tiles (use my own images)"])
     preset_name = sb.selectbox("Quick preset", list(PRESETS.keys()))
+
+    # Show tile-image uploader directly below the mode selector when Photo tiles is selected.
+    tile_files = []
+    tint = 0.2
+    if mode.startswith("Photo"):
+        sb.header("Photo tiles")
+        sb.caption("Upload one or more small images used as the mosaic tiles.")
+        tile_files = sb.file_uploader(
+            "Upload tile image(s)",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            key="photo_tile_images",
+            help="Select one or more images. To add more, open the picker again and select the complete set you want to use."
+        )
+        if tile_files:
+            sb.success(f"{len(tile_files)} tile image(s) selected.")
+            with sb.expander("View selected tile images"):
+                for i, f in enumerate(tile_files, start=1):
+                    sb.write(f"{i}. {f.name}")
+        tint = sb.slider("Tint strength", 0.0, 0.6, 0.2)
 
     sb.header("3. Settings")
     tile = sb.slider("Tile size (pixels)", 6, 48, 16)
@@ -466,15 +348,7 @@ def main():
     edge = sb.checkbox("Edge-aware tiles", True)
     gap = sb.slider("Gap between tiles", 0, 6, 1)
 
-    tile_files, tint = [], 0.2
-    if mode.startswith("Photo"):
-        sb.header("Photo tiles")
-        tile_files = sb.file_uploader("Upload 10 or more small images to use as tiles",
-                                      type=["jpg", "jpeg", "png"],
-                                      accept_multiple_files=True)
-        tint = sb.slider("Tint strength", 0.0, 0.6, 0.2)
-
-    sb.header("4. Improve photo first")
+    sb.header("5. Improve photo first")
     bright = sb.slider("Brightness", -60, 60, 0)
     contrast = sb.slider("Contrast", 0.5, 2.0, 1.0)
     sat = sb.slider("Color strength", 0.0, 2.0, 1.0)
@@ -487,12 +361,15 @@ def main():
         sb.success("Preset is active. Choose 'Custom' to use the sliders.")
 
     if uploaded is None:
-        st.info("Upload a photo from the left side to start.")
+        st.info("Upload a main photo from the left panel to start.")
         return
 
     img = decode(uploaded)
+    if img is None:
+        st.error("The main photo could not be read. Please upload a valid JPG or PNG image.")
+        return
     h, w = img.shape[:2]
-    scale = 800 / max(h, w)
+    scale = min(1.0, 800 / max(h, w))
     if scale < 1:
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     img = enhance(img, bright, contrast, sat, sharp)
@@ -501,15 +378,19 @@ def main():
 
     with st.spinner("Making your mosaic..."):
         if mode.startswith("Photo"):
+            if not tile_files:
+                st.warning("Upload at least one image in the separate Photo tiles section in the left panel.")
+                return
             lib = [decode(f) for f in tile_files]
             lib = [t for t in lib if t is not None]
-            if len(lib) < 3:
-                st.warning("Upload at least 3 small images (10 or more is better) in the left panel.")
+            if not lib:
+                st.warning("The tile image(s) could not be read. Please upload valid JPG or PNG images.")
                 return
             mosaic, n, layout = photo_mosaic(img, lib, tile, tint)
         else:
-            mosaic, n, layout = make_mosaic(img, tile, colors, shape, style,
-                                            adaptive, edge, gap=gap, palette=palette)
+            mosaic, n, layout = make_mosaic(
+                img, tile, colors, shape, style, adaptive, edge, gap=gap, palette=palette
+            )
         q = quality(img, mosaic)
 
     tab1, tab2, tab3 = st.tabs(["Result", "How it works", "Compare tile sizes"])
@@ -518,13 +399,11 @@ def main():
         c1, c2 = st.columns(2)
         c1.image(to_rgb(img), caption="Original", use_container_width=True)
         c2.image(to_rgb(mosaic), caption=f"Mosaic ({n} tiles)", use_container_width=True)
-
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Tiles used", n)
         m2.metric("MSE (lower is better)", q["MSE"])
         m3.metric("PSNR dB (higher is better)", q["PSNR (dB)"])
         m4.metric("SSIM (closer to 1 is better)", q["SSIM"])
-
         ok, buf = cv2.imencode(".png", mosaic)
         st.download_button("Download mosaic image", buf.tobytes(), "mosaic.png", "image/png")
 
@@ -533,20 +412,15 @@ def main():
         a, b, c = st.columns(3)
         a.image(to_rgb(img), caption="Step 1: Improved input photo", use_container_width=True)
         b.image(edge_map(img), caption="Step 2: Edges found by Canny", use_container_width=True)
-        c.image(to_rgb(layout), caption="Step 3: Tile layout (small tiles at details)",
-                use_container_width=True)
-
-        st.write("Step 4: The K-Means color palette. Every tile uses one of these colors.")
+        c.image(to_rgb(layout), caption="Step 3: Tile layout", use_container_width=True)
+        st.write("Step 4: The K-Means color palette. Each color tile uses the nearest palette color.")
         st.image(palette_image(palette_to_bgr(palette)))
-
-        st.write("Step 5: Each tile gets the nearest palette color. "
-                 "Step 6: MSE, PSNR and SSIM compare the mosaic with the original.")
+        st.write("Step 5: MSE, PSNR and SSIM compare the mosaic with the original image.")
 
     with tab3:
-        st.write("This runs the same settings with different tile sizes, "
-                 "and shows how quality changes. Good for your report.")
+        st.write("Compare the same settings using different tile sizes.")
         if mode.startswith("Photo"):
-            st.info("This tab works in 'Color tiles' mode.")
+            st.info("The tile-size comparison is available in Color tiles mode.")
         elif st.button("Run comparison"):
             rows = []
             bar = st.progress(0)
@@ -562,12 +436,13 @@ def main():
             st.dataframe(df, use_container_width=True, hide_index=True)
             d1, d2 = st.columns(2)
             d1.write("PSNR vs tile size")
-            d1.line_chart(df.set_index("Tile size")["PSNR (dB)"], color="#ff6ec4")
+            d1.line_chart(df.set_index("Tile size")["PSNR (dB)"])
             d2.write("SSIM vs tile size")
-            d2.line_chart(df.set_index("Tile size")["SSIM"], color="#7873f5")
+            d2.line_chart(df.set_index("Tile size")["SSIM"])
             st.download_button("Download table (CSV)", df.to_csv(index=False),
                                "comparison.csv", "text/csv")
 
 
 if __name__ == "__main__":
     main()
+// final code
